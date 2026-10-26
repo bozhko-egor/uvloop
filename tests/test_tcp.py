@@ -862,6 +862,37 @@ class _TestTCP:
 
         self.loop.run_until_complete(test())
 
+    def test_create_connection_sock_abort_detaches(self):
+        # If the protocol aborts the transport in connection_made(),
+        # connection_lost() closes the transport before
+        # create_connection() resumes. The passed socket must still be
+        # detached, so that its __del__ won't close a recycled fd.
+        class AbortProto(asyncio.Protocol):
+            def connection_made(self, transport):
+                transport.abort()
+
+        async def test():
+            srv = await asyncio.start_server(
+                lambda r, w: w.close(),
+                '127.0.0.1', 0,
+                family=socket.AF_INET)
+            addr = srv.sockets[0].getsockname()
+
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setblocking(False)
+            await self.loop.sock_connect(sock, addr)
+
+            tr, _ = await self.loop.create_connection(AbortProto, sock=sock)
+            self.assertTrue(tr.is_closing())
+            await asyncio.sleep(0)
+
+            self.assertEqual(sock.fileno(), -1)
+
+            srv.close()
+            await srv.wait_closed()
+
+        self.loop.run_until_complete(test())
+
 
 class Test_UV_TCP(_TestTCP, tb.UVTestCase):
 
