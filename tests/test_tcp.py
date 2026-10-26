@@ -6,6 +6,7 @@ import select
 import socket
 import unittest.mock
 import ssl
+import struct
 import sys
 import threading
 import time
@@ -3308,6 +3309,48 @@ class _TestSSL(tb.SSLTestCase):
             await server.wait_closed()
 
         self.loop.run_until_complete(run_main())
+
+    def test_create_connection_ssl_sock_reset_detaches(self):
+        # If the peer resets the connection before the ClientHello is
+        # written, connection_lost() closes the transport before
+        # create_connection() resumes. The passed socket must still be
+        # detached, so that its __del__ won't close a recycled fd.
+        client_sslctx = self._create_client_ssl_context()
+
+        # silence error logger
+        self.loop.set_exception_handler(lambda *args: None)
+
+        def reset(reader, writer):
+            writer.get_extra_info('socket').setsockopt(
+                socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+            writer.transport.abort()
+
+        async def test():
+            srv = await asyncio.start_server(
+                reset, '127.0.0.1', 0, family=socket.AF_INET)
+            addr = srv.sockets[0].getsockname()
+
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setblocking(False)
+            await self.loop.sock_connect(sock, addr)
+
+            # Wait for the RST to arrive.
+            for _ in range(500):
+                if select.select([sock], [], [], 0)[0]:
+                    break
+                await asyncio.sleep(0.01)
+
+            with self.assertRaises(OSError):
+                await self.loop.create_connection(
+                    asyncio.Protocol, sock=sock,
+                    ssl=client_sslctx, server_hostname='')
+
+            self.assertEqual(sock.fileno(), -1)
+
+            srv.close()
+            await srv.wait_closed()
+
+        self.loop.run_until_complete(test())
 
 
 class Test_UV_TCPSSL(_TestSSL, tb.UVTestCase):

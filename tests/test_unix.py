@@ -1,6 +1,7 @@
 import asyncio
 import os
 import pathlib
+import select
 import socket
 import tempfile
 import time
@@ -807,6 +808,44 @@ class _TestSSL(tb.SSLTestCase):
 
         with self._silence_eof_received_warning():
             run(client)
+
+    def test_create_unix_connection_ssl_sock_closed_detaches(self):
+        # Same as test_create_connection_ssl_sock_reset_detaches but for
+        # the create_unix_connection(sock=) path: writing the ClientHello
+        # to a socket whose peer is closed fails with EPIPE.
+        client_sslctx = self._create_client_ssl_context()
+
+        # silence error logger
+        self.loop.set_exception_handler(lambda *args: None)
+
+        async def test():
+            srv_path = os.path.join(tempfile.mkdtemp(), 'test.sock')
+            srv = await asyncio.start_unix_server(
+                lambda r, w: w.transport.abort(), path=srv_path)
+
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.setblocking(False)
+            await self.loop.sock_connect(sock, srv_path)
+
+            # Wait for the peer to close the connection.
+            for _ in range(500):
+                if select.select([sock], [], [], 0)[0]:
+                    break
+                await asyncio.sleep(0.01)
+
+            with self.assertRaises(OSError):
+                await self.loop.create_unix_connection(
+                    asyncio.Protocol, sock=sock,
+                    ssl=client_sslctx, server_hostname='')
+
+            self.assertEqual(sock.fileno(), -1)
+
+            srv.close()
+            await srv.wait_closed()
+            if os.path.exists(srv_path):
+                os.unlink(srv_path)
+
+        self.loop.run_until_complete(test())
 
 
 class Test_UV_UnixSSL(_TestSSL, tb.UVTestCase):
